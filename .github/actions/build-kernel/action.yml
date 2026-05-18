@@ -18,11 +18,6 @@ inputs:
     required: false
     type: string
     default: ""
-  ksu_version_override:
-    description: 'KSU 固定版本号（留空 = 自动按 git rev-list 计算；例如：40545）'
-    required: false
-    type: string
-    default: ""
   susfs_commit_hash_or_branch:
     description: 'SUSFS branch or commit hash (empty = auto-detect by kernel version)'
     required: false
@@ -909,16 +904,8 @@ runs:
         
         git submodule update --init --recursive
         cd KernelSU/kernel
-        # —— 版本号确定 ——
-        # 优先使用 ksu_version_override（用户显式给的），否则按 git rev-list + BASE 自动算
-        if [ -n "${{ inputs.ksu_version_override }}" ]; then
-          KSU_VERSION="${{ inputs.ksu_version_override }}"
-          echo "🔒 使用固定版本号: $KSU_VERSION"
-        else
-          BASE_VERSION=30000
-          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
-          echo "🔢 自动计算版本号: $KSU_VERSION"
-        fi
+        BASE_VERSION=30000
+        KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
 
         if grep -q "DKSU_VERSION=16" Makefile; then
           sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" Makefile
@@ -975,22 +962,8 @@ runs:
         
         cd KernelSU
 
-        # —— 版本号确定 ——
-        if [ -n "${{ inputs.ksu_version_override }}" ]; then
-          KSU_VERSION="${{ inputs.ksu_version_override }}"
-          echo "🔒 使用固定版本号: $KSU_VERSION"
-          # 找到 Makefile 把 DKSU_VERSION 强制改为我们指定的值
-          for mk in kernel/Makefile Makefile; do
-            if [ -f "$mk" ] && grep -q "DKSU_VERSION=" "$mk"; then
-              sed -i "s/-DKSU_VERSION=[0-9]\+/-DKSU_VERSION=${KSU_VERSION}/g" "$mk"
-              echo "🔧 已 patch $mk: DKSU_VERSION=${KSU_VERSION}"
-            fi
-          done
-        else
-          BASE_VERSION=30700
-          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
-          echo "🔢 自动计算版本号: $KSU_VERSION"
-        fi
+        BASE_VERSION=30700
+        KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
 
         KSU_COMMIT_SHA=$(git rev-parse HEAD)
         echo "KSU_COMMIT_SHA=$KSU_COMMIT_SHA" >> $GITHUB_ENV
@@ -1025,22 +998,9 @@ runs:
 
         cd KernelSU
 
-        # —— 版本号确定 ——
-        if [ -n "${{ inputs.ksu_version_override }}" ]; then
-          KSU_VERSION="${{ inputs.ksu_version_override }}"
-          echo "🔒 使用固定版本号: $KSU_VERSION"
-          for mk in kernel/Makefile Makefile; do
-            if [ -f "$mk" ] && grep -q "DKSU_VERSION=" "$mk"; then
-              sed -i "s/-DKSU_VERSION=[0-9]\+/-DKSU_VERSION=${KSU_VERSION}/g" "$mk"
-              echo "🔧 已 patch $mk: DKSU_VERSION=${KSU_VERSION}"
-            fi
-          done
-        else
-          # SukiSU-Ultra 的 BASE_VERSION 比 ReSukiSU 高，参考社区惯例
-          BASE_VERSION=12200
-          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
-          echo "🔢 自动计算版本号: $KSU_VERSION"
-        fi
+        # SukiSU-Ultra 的 BASE_VERSION 比 ReSukiSU 高，参考社区惯例
+        BASE_VERSION=12200
+        KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
 
         KSU_COMMIT_SHA=$(git rev-parse HEAD)
         echo "KSU_COMMIT_SHA=$KSU_COMMIT_SHA" >> $GITHUB_ENV
@@ -1082,23 +1042,34 @@ runs:
           echo "NEED_HOOKS=false" >> $GITHUB_ENV
         fi
         
+        # KernelSU 文件夹的 SuSFS 集成 patch —— 各 fork 处理不同：
+        #   - KSU (上游 tiann):    没有 SuSFS，必须 apply 这个 patch 才能集成
+        #   - SukiSU-Ultra:        setup.sh 不自带 SuSFS 集成，必须 apply patch（否则 manager 不显示 SuSFS）
+        #   - ReSukiSU:            setup.sh 自带 SuSFS 集成，跳过 patch（不跳会 conflict）
         case "$susfs_version" in
           "v1.5.8")
-            if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
-              cd "$KSU_FOLDER"
-              patch -p1 --forward --fuzz=3 < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
-            else
-              echo "ℹ️ Skipping KernelSU folder patch for ${{ inputs.ksu_type }}"
-            fi
+            case "${{ inputs.ksu_type }}" in
+              KSU|SukiSU-Ultra)
+                cd "$KSU_FOLDER"
+                echo "ℹ️ Applying 10_enable_susfs_for_ksu.patch for ${{ inputs.ksu_type }}"
+                patch -p1 --forward --fuzz=3 < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+                ;;
+              ReSukiSU)
+                echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU (setup.sh 自带 SuSFS 集成)"
+                ;;
+            esac
             ;;
           "v1.5.9"|"v1.5.10"|"v1.5.11"|"v1.5.12"|"v2.0.0"|"v2.1.0")
-            if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
-              cd "$KSU_FOLDER"
-              patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
-
-            else
-              echo "ℹ️ Skipping KernelSU folder patch for ${{ inputs.ksu_type }}"
-            fi
+            case "${{ inputs.ksu_type }}" in
+              KSU|SukiSU-Ultra)
+                cd "$KSU_FOLDER"
+                echo "ℹ️ Applying 10_enable_susfs_for_ksu.patch for ${{ inputs.ksu_type }}"
+                patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+                ;;
+              ReSukiSU)
+                echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU (setup.sh 自带 SuSFS 集成)"
+                ;;
+            esac
             ;;
           *)
             echo "::error::Unsupported SUSFS version: $susfs_version"
