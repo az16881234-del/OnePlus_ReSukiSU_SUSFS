@@ -107,11 +107,12 @@ on:
         default: true
 
       ksu_type:
-        description: 'KSU 类型（KPM 仅 ReSukiSU 支持）'
+        description: 'KSU 类型（KPM 支持：ReSukiSU / SukiSU-Ultra）'
         required: true
         type: choice
         options:
           - ReSukiSU
+          - SukiSU-Ultra
           - KSU
         default: ReSukiSU
 
@@ -120,6 +121,12 @@ on:
         required: false
         type: string
         default: main
+
+      ksu_version_override:
+        description: 'KSU 固定版本号（留空 = 按 git rev-list 自动算；示例：40545）'
+        required: false
+        type: string
+        default: ''
 
       susfs_branch_or_hash:
         description: 'SusFS 分支或提交哈希（留空 = 按内核版本自动选）'
@@ -182,10 +189,10 @@ jobs:
       - name: 🛡️ KPM 与 KSU 类型校验
         run: |
           if [ "${{ inputs.enable_kpm }}" = "true" ] && [ "${{ inputs.ksu_type }}" = "KSU" ]; then
-            echo "::error::KPM 仅 ReSukiSU 支持，tiann/KernelSU 上游没有 KPM hook。请把 ksu_type 改成 ReSukiSU 或关闭 enable_kpm"
+            echo "::error::KPM 不支持 tiann/KernelSU 上游。请改用 ReSukiSU 或 SukiSU-Ultra，或关闭 enable_kpm"
             exit 1
           fi
-          echo "✅ KPM/KSU 组合校验通过"
+          echo "✅ KPM/KSU 组合校验通过（ksu_type=${{ inputs.ksu_type }}, enable_kpm=${{ inputs.enable_kpm }}）"
 
       - name: 🔍 加载设备 JSON 配置
         id: gen
@@ -216,11 +223,11 @@ jobs:
           # 解析 KSU 哈希（main / 分支名 / 40-char hash 都接受）
           KSU_REF="${{ inputs.ksu_branch_or_hash }}"
           KSU_REF="${KSU_REF:-main}"
-          if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
-            KSU_REPO="ReSukiSU/ReSukiSU"
-          else
-            KSU_REPO="tiann/KernelSU"
-          fi
+          case "${{ inputs.ksu_type }}" in
+            ReSukiSU)      KSU_REPO="ReSukiSU/ReSukiSU" ;;
+            SukiSU-Ultra)  KSU_REPO="SukiSU-Ultra/SukiSU-Ultra" ;;
+            *)             KSU_REPO="tiann/KernelSU" ;;
+          esac
           KSU_SHA=$(gh api "repos/$KSU_REPO/commits/$KSU_REF" --jq '.sha' 2>/dev/null || echo "$KSU_REF")
           echo "ksu_resolved_hash=$KSU_SHA" >> "$GITHUB_OUTPUT"
           echo "ℹ️ KSU 解析：$KSU_REPO @ $KSU_REF → $KSU_SHA"
@@ -269,6 +276,11 @@ jobs:
             echo "| **KPM 启用** | ${{ inputs.enable_kpm && '✅ 是' || '❌ 否' }} |"
             echo "| **KSU 类型** | ${{ inputs.ksu_type }} |"
             echo "| **KSU 引用** | \`${{ inputs.ksu_branch_or_hash }}\` (\`${{ steps.gen.outputs.ksu_resolved_hash }}\`) |"
+            if [ -n "${{ inputs.ksu_version_override }}" ]; then
+              echo "| **KSU 固定版本号** | 🔒 \`${{ inputs.ksu_version_override }}\` |"
+            else
+              echo "| **KSU 固定版本号** | 🔢 自动（git rev-list 计算） |"
+            fi
             echo "| **SUSFS 版本** | ${{ steps.gen.outputs.susfs_version }} |"
             echo "| **优化等级** | ${{ inputs.optimize_level }} |"
             echo "| **清理构建** | ${{ inputs.clean_build && '✅ 是' || '❌ 否' }} |"
@@ -376,6 +388,7 @@ jobs:
           op_config_json: ${{ steps.prepare_config.outputs.config_json }}
           ksu_type: ${{ matrix.ksu_type }}
           ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
+          ksu_version_override: ${{ inputs.ksu_version_override }}
           susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
           optimize_level: ${{ inputs.optimize_level }}
           enable_kpm: ${{ inputs.enable_kpm }}
