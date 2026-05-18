@@ -122,6 +122,12 @@ on:
         type: string
         default: main
 
+      kernel_custom_suffix:
+        description: '自定义内核后缀（例如：Az1688）—— 会显示为 6.1.118-android14-{KSU哈希前8位}-{这里}'
+        required: false
+        type: string
+        default: ''
+
       susfs_branch_or_hash:
         description: 'SusFS 分支或提交哈希（留空 = 按内核版本自动选）'
         required: false
@@ -270,6 +276,12 @@ jobs:
             echo "| **KPM 启用** | ${{ inputs.enable_kpm && '✅ 是' || '❌ 否' }} |"
             echo "| **KSU 类型** | ${{ inputs.ksu_type }} |"
             echo "| **KSU 引用** | \`${{ inputs.ksu_branch_or_hash }}\` (\`${{ steps.gen.outputs.ksu_resolved_hash }}\`) |"
+            KSU_SHORT="${KSU_SHA:0:8}"
+            if [ -n "${{ inputs.kernel_custom_suffix }}" ]; then
+              echo "| **内核版本后缀** | \`-android*-\${KSU_SHORT}-${{ inputs.kernel_custom_suffix }}\` |"
+            else
+              echo "| **内核版本后缀** | \`-android*-\${KSU_SHORT}-${{ github.actor }}\`（默认） |"
+            fi
             echo "| **SUSFS 版本** | ${{ steps.gen.outputs.susfs_version }} |"
             echo "| **优化等级** | ${{ inputs.optimize_level }} |"
             echo "| **清理构建** | ${{ inputs.clean_build && '✅ 是' || '❌ 否' }} |"
@@ -377,6 +389,7 @@ jobs:
           op_config_json: ${{ steps.prepare_config.outputs.config_json }}
           ksu_type: ${{ matrix.ksu_type }}
           ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
+          kernel_custom_suffix: ${{ inputs.kernel_custom_suffix }}
           susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
           optimize_level: ${{ inputs.optimize_level }}
           enable_kpm: ${{ inputs.enable_kpm }}
