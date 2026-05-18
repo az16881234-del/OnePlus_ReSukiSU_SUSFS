@@ -1,0 +1,414 @@
+name: 构建一加内核（带 KPM）
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_config:
+        description: '配置文件(设备) — 选择要构建的设备/系统'
+        required: true
+        type: choice
+        default: OP-ACE-3V_OOS15
+        options:
+          - OP-ACE-3-PRO_OOS14
+          - OP-ACE-RACE_OOS14
+          - OP-ACE_OOS14
+          - OP-PAD-PRO_OOS14
+          - OP10pro_OOS14
+          - OP10r_OOS14
+          - OP11_OOS14
+          - OP11r_OOS14
+          - OP12_OOS14
+          - OP-ACE-2-PRO_OOS15
+          - OP-ACE-2-PRO_OOS16
+          - OP-ACE-2V_OOS15
+          - OP-ACE-2_OOS15
+          - OP-ACE-2_OOS16
+          - OP-ACE-3-PRO_OOS15
+          - OP-ACE-3-PRO_OOS16
+          - OP-ACE-3V_OOS15
+          - OP-ACE-3V_OOS16
+          - OP-ACE-3_OOS15
+          - OP-ACE-3_OOS16
+          - OP-ACE-5-PRO_OOS15
+          - OP-ACE-5-PRO_OOS16
+          - OP-ACE-5-RACE_OOS15
+          - OP-ACE-5-RACE_OOS16
+          - OP-ACE-5-ULTRA_OOS15
+          - OP-ACE-5-ULTRA_OOS16
+          - OP-ACE-5_OOS15
+          - OP-ACE-5_OOS16
+          - OP-ACE-6T_OOS16
+          - OP-ACE-6_OOS16
+          - OP-ACE-RACE_OOS15
+          - OP-ACE_OOS15
+          - OP-NORD-3_OOS15
+          - OP-NORD-4-CE_OOS15
+          - OP-NORD-4-CE_OOS16
+          - OP-NORD-4_OOS15
+          - OP-NORD-4_OOS16
+          - OP-NORD-5_OOS15
+          - OP-NORD-5_OOS16
+          - OP-NORD-CE-5_OOS15
+          - OP-NORD-CE-5_OOS16
+          - OP-NORD-CE4-LITE_OOS15
+          - OP-NORD-CE4-LITE_OOS16
+          - OP-OPEN_OOS15
+          - OP-OPEN_OOS16
+          - OP-PAD-2-MT6991_OOS16
+          - OP-PAD-2-PRO_OOS15
+          - OP-PAD-2-PRO_OOS16
+          - OP-PAD-2-SM8650_OOS15
+          - OP-PAD-2-SM8650_OOS16
+          - OP-PAD-3-MT6897_OOS15
+          - OP-PAD-3-MT6897_OOS16
+          - OP-PAD-3-SM8750_OOS15
+          - OP-PAD-3-SM8750_OOS16
+          - OP-PAD-GO-2_OOS16
+          - OP-PAD-LITE_OOS15
+          - OP-PAD-MT6983_OOS15
+          - OP-PAD-MT6983_OOS16
+          - OP-PAD-PRO_OOS15
+          - OP-PAD-PRO_OOS16
+          - OP-TURBO-6V_OOS16
+          - OP-TURBO-6_OOS16
+          - OP10pro_OOS15
+          - OP10pro_OOS16
+          - OP10r_OOS15
+          - OP10t_OOS15
+          - OP11_OOS15
+          - OP11_OOS16
+          - OP11r_OOS15
+          - OP11r_OOS16
+          - OP12_OOS15
+          - OP12_OOS16
+          - OP12r_OOS15
+          - OP12r_OOS16
+          - OP13-CPH_OOS15
+          - OP13-PJZ_OOS15
+          - OP13S_OOS15
+          - OP13S_OOS16
+          - OP13T_OOS15
+          - OP13T_OOS16
+          - OP13_OOS16
+          - OP13r_OOS15
+          - OP13r_OOS16
+          - OP15T_OOS16
+          - OP15_OOS16
+          - OP15r_OOS16
+
+      enable_kpm:
+        description: '启用 KPM（内核补丁模块）'
+        required: true
+        type: boolean
+        default: true
+
+      ksu_type:
+        description: 'KSU 类型（KPM 仅 ReSukiSU 支持）'
+        required: true
+        type: choice
+        options:
+          - ReSukiSU
+          - KSU
+        default: ReSukiSU
+
+      ksu_branch_or_hash:
+        description: 'KSU 分支或提交哈希（默认 main）'
+        required: false
+        type: string
+        default: main
+
+      susfs_branch_or_hash:
+        description: 'SusFS 分支或提交哈希（留空 = 按内核版本自动选）'
+        required: false
+        type: string
+        default: ''
+
+      optimize_level:
+        description: '编译优化等级'
+        required: true
+        type: choice
+        options: [O2, O3]
+        default: O2
+
+      clean_build:
+        description: '清理构建（禁用 ccache，速度慢但保证干净）'
+        required: false
+        type: boolean
+        default: false
+
+      make_release:
+        description: '是否创建 GitHub Release（含 Telegram 通知）'
+        required: false
+        type: boolean
+        default: false
+
+      debug:
+        description: '调试模式（保留 vmlinux / build log 等中间产物）'
+        required: false
+        type: boolean
+        default: false
+
+      build_timestamp:
+        description: '自定义 uname 时间戳（留空 = 当前时间），例如：Tue Feb 10 10:01:02 UTC 2026'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  resolve-config:
+    name: 📋 解析设备配置
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      ksu_resolved_hash: ${{ steps.gen.outputs.ksu_resolved_hash }}
+      susfs_resolved_hash: ${{ steps.gen.outputs.susfs_resolved_hash }}
+      susfs_version: ${{ steps.gen.outputs.susfs_version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: 📥 拉取代码
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: configs/
+          sparse-checkout-cone-mode: false
+
+      - name: 🛡️ KPM 与 KSU 类型校验
+        run: |
+          if [ "${{ inputs.enable_kpm }}" = "true" ] && [ "${{ inputs.ksu_type }}" = "KSU" ]; then
+            echo "::error::KPM 仅 ReSukiSU 支持，tiann/KernelSU 上游没有 KPM hook。请把 ksu_type 改成 ReSukiSU 或关闭 enable_kpm"
+            exit 1
+          fi
+          echo "✅ KPM/KSU 组合校验通过"
+
+      - name: 🔍 加载设备 JSON 配置
+        id: gen
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEVICE="${{ inputs.device_config }}"
+          MODEL="${DEVICE%_OOS*}"
+          OOS_RAW="OOS${DEVICE##*_OOS}"
+          OOS_LOWER="$(echo "$OOS_RAW" | tr '[:upper:]' '[:lower:]')"
+
+          CONFIG_FILE="configs/${OOS_LOWER}/${MODEL}.json"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::找不到配置文件 $CONFIG_FILE"
+            echo "解析结果：model=$MODEL oos=$OOS_LOWER"
+            exit 1
+          fi
+          echo "✅ 加载配置：$CONFIG_FILE"
+          cat "$CONFIG_FILE"
+
+          DEVICE_JSON=$(jq -c \
+            --arg t "${{ inputs.ksu_type }}" \
+            --arg h "${{ inputs.ksu_branch_or_hash }}" \
+            '. + {ksu_type: $t, ksu_hash: $h}' "$CONFIG_FILE")
+
+          KSU_REF="${{ inputs.ksu_branch_or_hash }}"
+          KSU_REF="${KSU_REF:-main}"
+          if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
+            KSU_REPO="ReSukiSU/ReSukiSU"
+          else
+            KSU_REPO="tiann/KernelSU"
+          fi
+          KSU_SHA=$(gh api "repos/$KSU_REPO/commits/$KSU_REF" --jq '.sha' 2>/dev/null || echo "$KSU_REF")
+          echo "ksu_resolved_hash=$KSU_SHA" >> "$GITHUB_OUTPUT"
+          echo "ℹ️ KSU 解析：$KSU_REPO @ $KSU_REF → $KSU_SHA"
+
+          SUSFS_ENABLED=$(jq -r '.susfs // false' "$CONFIG_FILE")
+          SUSFS_SHA=""
+          SUSFS_VER="none"
+          if [ "$SUSFS_ENABLED" = "true" ]; then
+            ANDROID_VER=$(jq -r '.android_version' "$CONFIG_FILE")
+            KERNEL_VER=$(jq -r '.kernel_version' "$CONFIG_FILE")
+            SUSFS_INPUT="${{ inputs.susfs_branch_or_hash }}"
+            if [ -z "$SUSFS_INPUT" ]; then
+              SUSFS_REF="gki-${ANDROID_VER}-${KERNEL_VER}"
+            else
+              SUSFS_REF="$SUSFS_INPUT"
+            fi
+            SUSFS_SHA=$(curl -sf "https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu/repository/commits/${SUSFS_REF}" | jq -r '.id // empty')
+            [ -z "$SUSFS_SHA" ] && SUSFS_SHA="$SUSFS_REF"
+            echo "ℹ️ SUSFS 解析：$SUSFS_REF → $SUSFS_SHA"
+
+            SUSFS_VER=$(curl -sf "https://gitlab.com/simonpunk/susfs4ksu/-/raw/${SUSFS_REF}/kernel_patches/include/linux/susfs.h" \
+              | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}' || echo "unknown")
+            echo "ℹ️ SUSFS 版本：$SUSFS_VER"
+          fi
+          echo "susfs_resolved_hash=$SUSFS_SHA" >> "$GITHUB_OUTPUT"
+          echo "susfs_version=$SUSFS_VER" >> "$GITHUB_OUTPUT"
+
+          MATRIX=$(jq -nc --argjson dev "$DEVICE_JSON" \
+            --arg ksu_sha "$KSU_SHA" \
+            --arg susfs_sha "$SUSFS_SHA" \
+            '{include: [$dev + {ksu_resolved_hash: $ksu_sha, susfs_resolved_hash: $susfs_sha}]}')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+      - name: 📊 构建计划摘要
+        run: |
+          {
+            echo "## 🎯 构建计划"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|------|------|"
+            echo "| **设备配置** | \`${{ inputs.device_config }}\` |"
+            echo "| **KPM 启用** | ${{ inputs.enable_kpm && '✅ 是' || '❌ 否' }} |"
+            echo "| **KSU 类型** | ${{ inputs.ksu_type }} |"
+            echo "| **KSU 引用** | \`${{ inputs.ksu_branch_or_hash }}\` (\`${{ steps.gen.outputs.ksu_resolved_hash }}\`) |"
+            echo "| **SUSFS 版本** | ${{ steps.gen.outputs.susfs_version }} |"
+            echo "| **优化等级** | ${{ inputs.optimize_level }} |"
+            echo "| **清理构建** | ${{ inputs.clean_build && '✅ 是' || '❌ 否' }} |"
+            echo "| **创建 Release** | ${{ inputs.make_release && '✅ 是' || '❌ 否' }} |"
+            echo "| **调试模式** | ${{ inputs.debug && '✅ 是' || '❌ 否' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: 🔨 构建 (${{ matrix.model }}, ${{ matrix.os_version }})
+    needs: resolve-config
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve-config.outputs.matrix) }}
+    steps:
+      - name: 📥 拉取代码
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: 🧹 磁盘清理（按需）
+        if: ${{ matrix.disk_cleanup }}
+        uses: ./.github/actions/disk-cleanup
+
+      - name: 🧹 准备 op_config_json
+        id: prepare_config
+        shell: bash
+        run: |
+          echo "config_json=$(jq -nc --argjson m '${{ toJSON(matrix) }}' '$m | del(.ksu_type, .ksu_hash, .ksu_resolved_hash, .susfs_resolved_hash)')" >> "$GITHUB_OUTPUT"
+
+      - name: 🔨 编译内核（启用 KPM=${{ inputs.enable_kpm }}）
+        id: build
+        uses: ./.github/actions/build-kernel
+        with:
+          op_config_json: ${{ steps.prepare_config.outputs.config_json }}
+          ksu_type: ${{ matrix.ksu_type }}
+          ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
+          susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
+          optimize_level: ${{ inputs.optimize_level }}
+          enable_kpm: ${{ inputs.enable_kpm }}
+          clean: ${{ inputs.clean_build }}
+          debug: ${{ inputs.debug }}
+          build_timestamp: ${{ inputs.build_timestamp }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📊 构建摘要
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "### ${{ matrix.model }} (${{ matrix.os_version }}) — ${{ job.status == 'success' && '✅ 成功' || '❌ 失败' }}"
+            echo ""
+            if [ "${{ steps.build.outcome }}" = "success" ]; then
+              echo "| 指标 | 值 |"
+              echo "|------|------|"
+              echo "| **内核版本** | ${{ steps.build.outputs.kernel_version }} |"
+              echo "| **KSU 版本** | v${{ steps.build.outputs.ksu_version }} |"
+              echo "| **SUSFS 版本** | ${{ steps.build.outputs.susfs_version }} |"
+              echo "| **KPM 启用** | ${{ inputs.enable_kpm && '✅ 是' || '❌ 否' }} |"
+              echo "| **构建耗时** | ${{ steps.build.outputs.build_time }}s |"
+              echo "| **Image SHA256** | \`${{ steps.build.outputs.image_sha256 }}\` |"
+              echo "| **ZIP SHA256** | \`${{ steps.build.outputs.zip_sha256 }}\` |"
+              echo "| **ccache 命中率** | ${{ steps.build.outputs.ccache_hit_rate }} |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: 🚀 创建 Release
+    needs: [resolve-config, build]
+    if: |
+      !cancelled() &&
+      inputs.make_release == true &&
+      needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: 📥 拉取代码
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 📥 下载构建产物
+        uses: actions/download-artifact@v8
+        with:
+          path: ./artifacts
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: 🏷️ 生成 Release Tag
+        id: tag
+        run: |
+          SUSFS_VER="${{ needs.resolve-config.outputs.susfs_version }}"
+          BASE_TAG="${SUSFS_VER:-custom}-KPM"
+          LATEST=$(gh api repos/${{ github.repository }}/tags --jq "[.[] | select(.name | startswith(\"${BASE_TAG}-r\"))] | sort_by(.name | split(\"-r\")[-1] | tonumber) | last | .name // empty")
+          if [ -z "$LATEST" ]; then
+            NEW_TAG="${BASE_TAG}-r1"
+          else
+            NEW_TAG=$(echo "$LATEST" | awk -F'-r' '{printf "%s-r%d", $1, $NF+1}')
+          fi
+          echo "NEW_TAG=$NEW_TAG" >> "$GITHUB_ENV"
+          echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: 📝 生成 Release 说明
+        run: |
+          cat > release_notes.md << EOF
+          # 🎯 一加内核 — ${{ inputs.ksu_type }} + SUSFS ${{ needs.resolve-config.outputs.susfs_version }}${{ inputs.enable_kpm && ' + KPM' || '' }}
+
+          > **构建时间**：$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          > **构建 ID**：\`${{ github.run_id }}\`
+
+          ## 📦 设备
+          - **${{ inputs.device_config }}**
+
+          ## 🔧 构建配置
+          | 项目 | 值 |
+          |------|------|
+          | KSU 类型 | ${{ inputs.ksu_type }} |
+          | KSU 引用 | \`${{ inputs.ksu_branch_or_hash }}\` |
+          | KPM 启用 | ${{ inputs.enable_kpm && '✅ 是（已 patch_linux 注入 Image）' || '❌ 否' }} |
+          | SUSFS 版本 | ${{ needs.resolve-config.outputs.susfs_version }} |
+          | 优化等级 | ${{ inputs.optimize_level }} |
+
+          ## ✨ 特性
+          - **${{ inputs.ksu_type }}** — 内核级 Root 方案
+          - **SUSFS** — 高级 Root 隐藏
+          ${{ inputs.enable_kpm && '- **KPM** — 运行时加载 .kpm 内核补丁，可挡进程内存扫描类反 root 检测' || '' }}
+
+          ## 📥 刷入说明
+          1. 已 unlock bootloader
+          2. 备份现有 boot.img
+          3. 在已有 Root 环境下用 Kernel Flasher 刷入下方 AnyKernel3 ZIP
+
+          ---
+          ⚡ 由 GitHub Actions 自动构建
+          EOF
+
+      - name: 🚀 创建 GitHub Release
+        run: |
+          gh release create "${{ env.NEW_TAG }}" \
+            --repo "${{ github.repository }}" \
+            --title "一加内核 ${{ inputs.ksu_type }}${{ inputs.enable_kpm && ' + KPM' || '' }} (${{ env.NEW_TAG }})" \
+            --notes-file release_notes.md
+
+      - name: 📤 上传产物到 Release
+        run: |
+          for f in ./artifacts/*.zip; do
+            [ -f "$f" ] || continue
+            echo "Uploading $(basename "$f")..."
+            gh release upload "${{ env.NEW_TAG }}" "$f" --clobber
+          done
