@@ -18,6 +18,11 @@ inputs:
     required: false
     type: string
     default: ""
+  kernel_custom_suffix:
+    description: 'Custom suffix for kernel LOCALVERSION (e.g. "Az1688"); empty = fall back to github.actor'
+    required: false
+    type: string
+    default: ""
   susfs_commit_hash_or_branch:
     description: 'SUSFS branch or commit hash (empty = auto-detect by kernel version)'
     required: false
@@ -1044,15 +1049,35 @@ runs:
         
         # KernelSU 文件夹的 SuSFS 集成 patch —— 各 fork 处理不同：
         #   - KSU (上游 tiann):    没有 SuSFS，必须 apply 这个 patch 才能集成
-        #   - SukiSU-Ultra:        setup.sh 不自带 SuSFS 集成，必须 apply patch（否则 manager 不显示 SuSFS）
+        #   - SukiSU-Ultra:        setup.sh 不自带 SuSFS 集成，必须 apply patch
         #   - ReSukiSU:            setup.sh 自带 SuSFS 集成，跳过 patch（不跳会 conflict）
+        #
+        # 关键：patch 失败必须 FAIL，不再 `|| true` 忍着 —— 用户勾了 SuSFS 就必须真的有
+        apply_ksu_susfs_patch() {
+          local patch_file="$1"
+          local extra_flags="${2:-}"
+          if patch -p1 --forward $extra_flags < "$patch_file"; then
+            echo "✅ KSU SuSFS patch applied cleanly"
+            return 0
+          fi
+          # patch 返回非零，可能是「已经打过了」或「真冲突」，分辨一下
+          if patch -p1 --dry-run -R < "$patch_file" >/dev/null 2>&1; then
+            echo "✅ KSU SuSFS patch 已经在 setup.sh 里集成过了（reversed 检测通过）"
+            return 0
+          fi
+          echo "::error::KSU SuSFS patch ($patch_file) 应用失败 ——"
+          echo "::error::对 ksu_type=${{ inputs.ksu_type }}, susfs=${susfs_version} 的组合不兼容"
+          echo "::error::.rej 文件内容："
+          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
+          return 1
+        }
         case "$susfs_version" in
           "v1.5.8")
             case "${{ inputs.ksu_type }}" in
               KSU|SukiSU-Ultra)
                 cd "$KSU_FOLDER"
                 echo "ℹ️ Applying 10_enable_susfs_for_ksu.patch for ${{ inputs.ksu_type }}"
-                patch -p1 --forward --fuzz=3 < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+                apply_ksu_susfs_patch "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" "--fuzz=3"
                 ;;
               ReSukiSU)
                 echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU (setup.sh 自带 SuSFS 集成)"
@@ -1064,7 +1089,7 @@ runs:
               KSU|SukiSU-Ultra)
                 cd "$KSU_FOLDER"
                 echo "ℹ️ Applying 10_enable_susfs_for_ksu.patch for ${{ inputs.ksu_type }}"
-                patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+                apply_ksu_susfs_patch "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
                 ;;
               ReSukiSU)
                 echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU (setup.sh 自带 SuSFS 集成)"
@@ -1848,11 +1873,28 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        echo "Customize Kernel Branding"
+        echo "::group::Customize Kernel Branding"
         cd "$COMMON_KERNEL_FOLDER"
         mkdir -p out
-        CUSTOM_LOCALVERSION="-${ANDROID_VER}-${OP_UNAME}-${{ github.actor }}"
+
+        # 中间段：KSU commit hash 前 8 位（c543f744 这种）
+        # KSU_COMMIT_SHA 是 Add KernelSU / ReSukiSU / SukiSU-Ultra step 设进 env 的
+        KSU_SHORT="${KSU_COMMIT_SHA:0:8}"
+        [ -z "$KSU_SHORT" ] && KSU_SHORT="$OP_UNAME"   # 兜底：拿不到 KSU hash 就用 OP_UNAME
+
+        # 后缀段：用户输入 > 默认 github 用户名
+        if [ -n "${{ inputs.kernel_custom_suffix }}" ]; then
+          SUFFIX="${{ inputs.kernel_custom_suffix }}"
+          echo "🔧 使用自定义后缀: $SUFFIX"
+        else
+          SUFFIX="${{ github.actor }}"
+          echo "ℹ️  使用默认后缀（github.actor）: $SUFFIX"
+        fi
+
+        CUSTOM_LOCALVERSION="-${ANDROID_VER}-${KSU_SHORT}-${SUFFIX}"
         echo "CUSTOM_LOCALVERSION=$CUSTOM_LOCALVERSION" >> "$GITHUB_ENV"
+        echo "✅ 内核版本将显示为: ${KERNEL_FULL_VER:-<auto>}${CUSTOM_LOCALVERSION}"
+        echo "::endgroup::"
 
     - name: Disable GPUEB
       shell: bash
@@ -2075,6 +2117,74 @@ runs:
         echo "::endgroup::"
 
     # ============================================
+    # 🛡️ 强制校验 1：.config 必须包含 SuSFS / KPM 对应的 CONFIG
+    # ============================================
+    # 即便前面 SuSFS patch 应用了，olddefconfig 也可能因为 Kconfig 缺少而把 CONFIG_KSU_SUSFS 丢掉
+    # 必须在 build 完后检查最终 .config 才能 100% 确定真编进去了
+    - name: 🛡️ 强制校验 .config（SuSFS / KPM 必须真启用）
+      shell: bash
+      if: success()
+      run: |
+        set -euo pipefail
+        echo "::group::Verify CONFIG_KSU_SUSFS / CONFIG_KPM in final .config"
+
+        CONFIG_FILE="$COMMON_KERNEL_FOLDER/out/.config"
+        if [ ! -f "$CONFIG_FILE" ]; then
+          echo "::error::找不到 final .config: $CONFIG_FILE"
+          exit 1
+        fi
+
+        FAIL=0
+
+        # SuSFS 校验 —— 用户设备 JSON 标了 susfs:true 就必须真有
+        if [ "$OP_SUSFS" = "true" ]; then
+          if grep -q "^CONFIG_KSU_SUSFS=y" "$CONFIG_FILE"; then
+            echo "✅ CONFIG_KSU_SUSFS=y 已在最终 .config"
+          else
+            echo "::error::设备配置 susfs=true，但最终 .config 缺少 CONFIG_KSU_SUSFS=y"
+            echo "::error::可能 olddefconfig 把它丢了（Kconfig 没识别）或 patch 没真正生效"
+            grep -E "^(# )?CONFIG_KSU_SUSFS" "$CONFIG_FILE" || echo "（连占位都没有）"
+            FAIL=1
+          fi
+          # 顺便看几个常用子选项
+          for sub in SUS_PATH SUS_MOUNT SPOOF_UNAME SPOOF_CMDLINE_OR_BOOTCONFIG; do
+            grep -q "^CONFIG_KSU_SUSFS_${sub}=y" "$CONFIG_FILE" \
+              && echo "  ✅ CONFIG_KSU_SUSFS_${sub}=y" \
+              || echo "  ⚠️  CONFIG_KSU_SUSFS_${sub} 未启用"
+          done
+        else
+          echo "ℹ️  OP_SUSFS=false，跳过 SuSFS 校验"
+        fi
+
+        # KPM 校验 —— 用户勾了 enable_kpm 就必须真有
+        if [ "${{ inputs.enable_kpm }}" = "true" ]; then
+          if grep -q "^CONFIG_KPM=y" "$CONFIG_FILE"; then
+            echo "✅ CONFIG_KPM=y 已在最终 .config"
+          else
+            echo "::error::勾选了 enable_kpm=true，但最终 .config 缺少 CONFIG_KPM=y"
+            echo "::error::ksu_type=${{ inputs.ksu_type }} 可能不支持 KPM，或 Kconfig 没识别"
+            grep -E "^(# )?CONFIG_KPM" "$CONFIG_FILE" || echo "（连占位都没有）"
+            FAIL=1
+          fi
+          # 依赖项
+          for dep in KALLSYMS KALLSYMS_ALL; do
+            grep -q "^CONFIG_${dep}=y" "$CONFIG_FILE" \
+              && echo "  ✅ CONFIG_${dep}=y" \
+              || echo "  ⚠️  CONFIG_${dep} 未启用（KPM 可能跑不动）"
+          done
+        else
+          echo "ℹ️  enable_kpm=false，跳过 KPM 校验"
+        fi
+
+        if [ "$FAIL" = "1" ]; then
+          echo ""
+          echo "::error::有必要的 CONFIG 没编进去，build 失败"
+          echo "::error::（用户勾选了但没生效。检查 patch 步骤日志看哪步出问题）"
+          exit 1
+        fi
+        echo "::endgroup::"
+
+    # ============================================
     # KPM patch_linux 后处理 —— 在 Image 上注入 KPM signature
     # ============================================
     # SukiSU/ReSukiSU 的 KPM 必须在编译完后用 patch_linux 工具改 Image，
@@ -2118,11 +2228,13 @@ runs:
           echo "✅ patch_linux 完成"
           echo "原 Image: $OLD_SIZE bytes"
           echo "新 Image: $NEW_SIZE bytes (差: $((NEW_SIZE - OLD_SIZE)) bytes)"
-          # 自检：strings 能搜到 KPM/SukiSU 关键字说明 patch 真生效
+          # 自检：strings 能搜到 KPM/SukiSU 关键字说明 patch 真生效（之前是 warning，现在改成 hard fail）
           if strings Image | grep -qE "kernel_patch|KPM_|SukiSU"; then
             echo "✅ Self-check passed: Image 内含 KPM signature"
           else
-            echo "::warning::patch_linux 跑完了但 strings 搜不到 KPM 关键字"
+            echo "::error::patch_linux 跑完了但 strings 搜不到 KPM 关键字 —— KPM 签名没真正注入"
+            echo "::error::用户勾了 enable_kpm，必须有；build 视为失败"
+            exit 1
           fi
           rm -f Image.unpatched
         else
