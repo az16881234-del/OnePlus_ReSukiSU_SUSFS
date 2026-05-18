@@ -32,6 +32,11 @@ inputs:
     required: false
     type: string
     default: O2
+  enable_kpm:
+    description: 'Enable KPM (Kernel Patch Module) [仅 ReSukiSU 有效]'
+    required: false
+    type: boolean
+    default: false
   clean:
     description: 'Force clean build without ccache acceleration'
     required: false
@@ -1723,7 +1728,28 @@ runs:
         CONFIG_CMDLINE_FORCE=n
         CONFIG_RUST=y
         EOF
-    
+
+    # ============================================
+    # KPM (Kernel Patch Module) 支持 —— 仅 ReSukiSU
+    # ============================================
+    # KPM 来自 SukiSU-Ultra 系列，运行时加载 .kpm 二进制内核补丁
+    # 需要两步：1) defconfig 写 CONFIG_KPM=y  2) Build 后用 patch_linux 在 Image 注入 KPM signature
+    # 缺任何一步 manager 都会显示 "KPM 不支持(内核未配置)"
+    - name: Add KPM Support (CONFIG_KPM=y)
+      shell: bash
+      if: ${{ inputs.enable_kpm == 'true' && inputs.ksu_type == 'ReSukiSU' }}
+      run: |
+        set -euo pipefail
+        echo "::group::Add KPM Support"
+        cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
+        CONFIG_KPM=y
+        CONFIG_KALLSYMS=y
+        CONFIG_KALLSYMS_ALL=y
+        EOF
+        echo "✅ KPM defconfig 已写入"
+        grep -E "CONFIG_(KPM|KALLSYMS)" "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" | sort -u
+        echo "::endgroup::"
+
     - name: Resolve KSU Symbol Dependencies
       shell: bash
       run: |
@@ -1997,6 +2023,64 @@ runs:
           ccache -s
         fi
         echo "============================================"
+        echo "::endgroup::"
+
+    # ============================================
+    # KPM patch_linux 后处理 —— 在 Image 上注入 KPM signature
+    # ============================================
+    # SukiSU/ReSukiSU 的 KPM 必须在编译完后用 patch_linux 工具改 Image，
+    # 否则 manager 显示 "内核未配置"。这步必须在 Image 路径校验前完成。
+    - name: 🩹 KPM patch_linux (Image 注入 KPM signature)
+      shell: bash
+      if: ${{ success() && inputs.enable_kpm == 'true' && inputs.ksu_type == 'ReSukiSU' }}
+      run: |
+        set -euo pipefail
+        echo "::group::Apply patch_linux for KPM"
+
+        # 跟后续 Collect Build Stats / Create Zip 同款的 Image 路径搜索逻辑
+        IMG="$COMMON_KERNEL_FOLDER/out/arch/arm64/boot/Image"
+        if [ -f "$KERNEL_PLATFORM_FOLDER/out/$OP_ANDROID_VERSION-$OP_KERNEL_VERSION/dist/Image" ]; then
+          IMG="$KERNEL_PLATFORM_FOLDER/out/$OP_ANDROID_VERSION-$OP_KERNEL_VERSION/dist/Image"
+        elif [ -f "$KERNEL_PLATFORM_FOLDER/bazel-bin/common/kernel_aarch64/Image" ]; then
+          IMG="$KERNEL_PLATFORM_FOLDER/bazel-bin/common/kernel_aarch64/Image"
+        fi
+
+        [ -f "$IMG" ] || { echo "::error::找不到 Image: $IMG"; exit 1; }
+        echo "ℹ️  Target Image: $IMG ($(stat -c%s "$IMG") bytes)"
+
+        cd "$(dirname "$IMG")"
+
+        # 下载 patch_linux —— SukiSU 系列共用同一个工具
+        if [ ! -x ./patch_linux ]; then
+          echo "Downloading patch_linux..."
+          curl -fsSL --retry 5 \
+            https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/latest/download/patch_linux \
+            -o patch_linux
+          chmod +x patch_linux
+        fi
+
+        cp Image Image.unpatched
+        ./patch_linux
+
+        if [ -f oImage ]; then
+          mv -f oImage Image
+          NEW_SIZE=$(stat -c%s Image)
+          OLD_SIZE=$(stat -c%s Image.unpatched)
+          echo "✅ patch_linux 完成"
+          echo "原 Image: $OLD_SIZE bytes"
+          echo "新 Image: $NEW_SIZE bytes (差: $((NEW_SIZE - OLD_SIZE)) bytes)"
+          # 自检：strings 能搜到 KPM/SukiSU 关键字说明 patch 真生效
+          if strings Image | grep -qE "kernel_patch|KPM_|SukiSU"; then
+            echo "✅ Self-check passed: Image 内含 KPM signature"
+          else
+            echo "::warning::patch_linux 跑完了但 strings 搜不到 KPM 关键字"
+          fi
+          rm -f Image.unpatched
+        else
+          echo "::error::patch_linux 没生成 oImage，KPM 注入失败"
+          ls -la
+          exit 1
+        fi
         echo "::endgroup::"
 
     - name: 📊 ccache Post-Build Statistics
