@@ -122,12 +122,6 @@ on:
         type: string
         default: main
 
-      ksu_version_override:
-        description: 'KSU 固定版本号（留空 = 按 git rev-list 自动算；示例：40545）'
-        required: false
-        type: string
-        default: ''
-
       susfs_branch_or_hash:
         description: 'SusFS 分支或提交哈希（留空 = 按内核版本自动选）'
         required: false
@@ -276,11 +270,6 @@ jobs:
             echo "| **KPM 启用** | ${{ inputs.enable_kpm && '✅ 是' || '❌ 否' }} |"
             echo "| **KSU 类型** | ${{ inputs.ksu_type }} |"
             echo "| **KSU 引用** | \`${{ inputs.ksu_branch_or_hash }}\` (\`${{ steps.gen.outputs.ksu_resolved_hash }}\`) |"
-            if [ -n "${{ inputs.ksu_version_override }}" ]; then
-              echo "| **KSU 固定版本号** | 🔒 \`${{ inputs.ksu_version_override }}\` |"
-            else
-              echo "| **KSU 固定版本号** | 🔢 自动（git rev-list 计算） |"
-            fi
             echo "| **SUSFS 版本** | ${{ steps.gen.outputs.susfs_version }} |"
             echo "| **优化等级** | ${{ inputs.optimize_level }} |"
             echo "| **清理构建** | ${{ inputs.clean_build && '✅ 是' || '❌ 否' }} |"
@@ -388,7 +377,6 @@ jobs:
           op_config_json: ${{ steps.prepare_config.outputs.config_json }}
           ksu_type: ${{ matrix.ksu_type }}
           ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
-          ksu_version_override: ${{ inputs.ksu_version_override }}
           susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
           optimize_level: ${{ inputs.optimize_level }}
           enable_kpm: ${{ inputs.enable_kpm }}
