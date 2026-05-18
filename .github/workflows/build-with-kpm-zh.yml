@@ -159,6 +159,9 @@ on:
         default: ''
 
 jobs:
+  # ============================================================
+  # 第 1 阶段：解析 device_config，加载 JSON，并校验 KPM 兼容性
+  # ============================================================
   resolve-config:
     name: 📋 解析设备配置
     runs-on: ubuntu-latest
@@ -190,6 +193,7 @@ jobs:
         run: |
           set -euo pipefail
           DEVICE="${{ inputs.device_config }}"
+          # 解析格式：MODEL_OOSxx → model=MODEL, oos=oosxx (小写)
           MODEL="${DEVICE%_OOS*}"
           OOS_RAW="OOS${DEVICE##*_OOS}"
           OOS_LOWER="$(echo "$OOS_RAW" | tr '[:upper:]' '[:lower:]')"
@@ -203,11 +207,13 @@ jobs:
           echo "✅ 加载配置：$CONFIG_FILE"
           cat "$CONFIG_FILE"
 
+          # 注入 ksu 字段，方便 build job 用
           DEVICE_JSON=$(jq -c \
             --arg t "${{ inputs.ksu_type }}" \
             --arg h "${{ inputs.ksu_branch_or_hash }}" \
             '. + {ksu_type: $t, ksu_hash: $h}' "$CONFIG_FILE")
 
+          # 解析 KSU 哈希（main / 分支名 / 40-char hash 都接受）
           KSU_REF="${{ inputs.ksu_branch_or_hash }}"
           KSU_REF="${KSU_REF:-main}"
           if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
@@ -219,9 +225,8 @@ jobs:
           echo "ksu_resolved_hash=$KSU_SHA" >> "$GITHUB_OUTPUT"
           echo "ℹ️ KSU 解析：$KSU_REPO @ $KSU_REF → $KSU_SHA"
 
+          # 解析 SUSFS（如果设备 JSON susfs=true）
           SUSFS_ENABLED=$(jq -r '.susfs // false' "$CONFIG_FILE")
-          SUSFS_SHA=""
-          SUSFS_VER="none"
           if [ "$SUSFS_ENABLED" = "true" ]; then
             ANDROID_VER=$(jq -r '.android_version' "$CONFIG_FILE")
             KERNEL_VER=$(jq -r '.kernel_version' "$CONFIG_FILE")
@@ -233,15 +238,20 @@ jobs:
             fi
             SUSFS_SHA=$(curl -sf "https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu/repository/commits/${SUSFS_REF}" | jq -r '.id // empty')
             [ -z "$SUSFS_SHA" ] && SUSFS_SHA="$SUSFS_REF"
+            echo "susfs_resolved_hash=$SUSFS_SHA" >> "$GITHUB_OUTPUT"
             echo "ℹ️ SUSFS 解析：$SUSFS_REF → $SUSFS_SHA"
 
+            # 顺便从 susfs.h 抓 SUSFS_VERSION 用于 release tag
             SUSFS_VER=$(curl -sf "https://gitlab.com/simonpunk/susfs4ksu/-/raw/${SUSFS_REF}/kernel_patches/include/linux/susfs.h" \
               | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}' || echo "unknown")
+            echo "susfs_version=$SUSFS_VER" >> "$GITHUB_OUTPUT"
             echo "ℹ️ SUSFS 版本：$SUSFS_VER"
+          else
+            echo "susfs_resolved_hash=" >> "$GITHUB_OUTPUT"
+            echo "susfs_version=none" >> "$GITHUB_OUTPUT"
           fi
-          echo "susfs_resolved_hash=$SUSFS_SHA" >> "$GITHUB_OUTPUT"
-          echo "susfs_version=$SUSFS_VER" >> "$GITHUB_OUTPUT"
 
+          # 把 device JSON + KSU/SUSFS 哈希塞进 matrix
           MATRIX=$(jq -nc --argjson dev "$DEVICE_JSON" \
             --arg ksu_sha "$KSU_SHA" \
             --arg susfs_sha "$SUSFS_SHA" \
@@ -266,6 +276,9 @@ jobs:
             echo "| **调试模式** | ${{ inputs.debug && '✅ 是' || '❌ 否' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # ============================================================
+  # 第 2 阶段：编译内核（调用现有 build-kernel composite action）
+  # ============================================================
   build:
     name: 🔨 构建 (${{ matrix.model }}, ${{ matrix.os_version }})
     needs: resolve-config
@@ -283,7 +296,74 @@ jobs:
         if: ${{ matrix.disk_cleanup }}
         uses: ./.github/actions/disk-cleanup
 
-      - name: 🧹 准备 op_config_json
+      - name: 📦 安装最少依赖
+        run: |
+          set -euo pipefail
+          echo "::group::Install dependencies"
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential clang lld flex bison \
+            libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
+            libxml2-utils rsync unzip dwarves file python3 ccache jq bc dos2unix kmod libdw-dev elfutils pigz aria2
+          sudo apt-get clean
+          echo "::endgroup::"
+
+      - name: ⚡ 安装 ccache (ECS by cctv18)
+        run: |
+          set -euo pipefail
+          echo "::group::Install ccache ECS"
+          curl -LfsS --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+            -H "User-Agent: Mozilla/5.0" \
+            "https://github.com/WildKernels/kernel_patches/raw/refs/heads/main/ccache/ccache-x86-64" -o ccache
+          sudo cp -f ./ccache /usr/bin/ccache
+          sudo chmod +x /usr/bin/ccache
+          rm -f ./ccache
+          echo "ccache version: $(ccache --version | head -1)"
+          echo "::endgroup::"
+
+      - name: ♻️ 配置 ccache 与 LTO 缓存路径
+        run: |
+          set -euo pipefail
+          echo "::group::Configure ccache env"
+          CACHE_DIR="${{ github.workspace }}/.ccache"
+          LDCACHE_DIR="${{ github.workspace }}/.ld_cache"
+          CCACHE_LOG="${{ github.workspace }}/ccache.log"
+          mkdir -p "$CACHE_DIR" "$LDCACHE_DIR"
+
+          SETTINGS=(
+            "CCACHE_DIR=$CACHE_DIR"
+            "LDCACHE_DIR=$LDCACHE_DIR"
+            "CCACHE_MAXSIZE=12G"
+            "CCACHE_COMPILERCHECK=content"
+            "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+            "CCACHE_NOHASHDIR=true"
+            "CCACHE_IGNOREOPTIONS=--sysroot*"
+            "CCACHE_COMPRESSION=true"
+            "CCACHE_COMPRESSION_LEVEL=3"
+            "CCACHE_DIRECT=true"
+            "CCACHE_FILE_CLONE=true"
+            "CCACHE_INODE_CACHE=true"
+            "CCACHE_IS_KERNEL_COMPILING=true"
+            "CCACHE_UMASK=002"
+            "CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale"
+          )
+          for setting in "${SETTINGS[@]}"; do
+            export "$setting"
+            echo "$setting" >> "$GITHUB_ENV"
+          done
+
+          if [ "${{ inputs.debug }}" = "true" ]; then
+            echo "CCACHE_LOGFILE=$CCACHE_LOG" >> "$GITHUB_ENV"
+          fi
+          if ccache --help 2>&1 | grep -q 'depend_mode'; then
+            echo "CCACHE_DEPEND=true" >> "$GITHUB_ENV"
+          fi
+
+          echo "✅ ccache configured"
+          ccache -p
+          echo "::endgroup::"
+
+      - name: 🧹 准备 op_config_json（去掉 KSU 字段，交给 action 传参处理）
         id: prepare_config
         shell: bash
         run: |
@@ -325,6 +405,9 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # ============================================================
+  # 第 3 阶段：可选 Release（make_release=true 才执行）
+  # ============================================================
   release:
     name: 🚀 创建 Release
     needs: [resolve-config, build]
@@ -355,6 +438,7 @@ jobs:
         run: |
           SUSFS_VER="${{ needs.resolve-config.outputs.susfs_version }}"
           BASE_TAG="${SUSFS_VER:-custom}-KPM"
+          # 找已有同前缀 tag 决定 -rN 后缀
           LATEST=$(gh api repos/${{ github.repository }}/tags --jq "[.[] | select(.name | startswith(\"${BASE_TAG}-r\"))] | sort_by(.name | split(\"-r\")[-1] | tonumber) | last | .name // empty")
           if [ -z "$LATEST" ]; then
             NEW_TAG="${BASE_TAG}-r1"
