@@ -12,8 +12,14 @@ inputs:
     options:
       - KSU
       - ReSukiSU
+      - SukiSU-Ultra
   ksu_branch_or_hash:
     description: 'KSU branch or commit hash (empty = auto-detect by ksu_type)'
+    required: false
+    type: string
+    default: ""
+  ksu_version_override:
+    description: 'KSU 固定版本号（留空 = 自动按 git rev-list 计算；例如：40545）'
     required: false
     type: string
     default: ""
@@ -33,7 +39,7 @@ inputs:
     type: string
     default: O2
   enable_kpm:
-    description: 'Enable KPM (Kernel Patch Module) [仅 ReSukiSU 有效]'
+    description: 'Enable KPM (Kernel Patch Module) [ReSukiSU / SukiSU-Ultra 有效]'
     required: false
     type: boolean
     default: false
@@ -903,9 +909,17 @@ runs:
         
         git submodule update --init --recursive
         cd KernelSU/kernel
-        BASE_VERSION=30000
-        KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
-        
+        # —— 版本号确定 ——
+        # 优先使用 ksu_version_override（用户显式给的），否则按 git rev-list + BASE 自动算
+        if [ -n "${{ inputs.ksu_version_override }}" ]; then
+          KSU_VERSION="${{ inputs.ksu_version_override }}"
+          echo "🔒 使用固定版本号: $KSU_VERSION"
+        else
+          BASE_VERSION=30000
+          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
+          echo "🔢 自动计算版本号: $KSU_VERSION"
+        fi
+
         if grep -q "DKSU_VERSION=16" Makefile; then
           sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" Makefile
         fi
@@ -960,21 +974,85 @@ runs:
         fi
         
         cd KernelSU
-        
-        BASE_VERSION=30700
-        KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
-        
+
+        # —— 版本号确定 ——
+        if [ -n "${{ inputs.ksu_version_override }}" ]; then
+          KSU_VERSION="${{ inputs.ksu_version_override }}"
+          echo "🔒 使用固定版本号: $KSU_VERSION"
+          # 找到 Makefile 把 DKSU_VERSION 强制改为我们指定的值
+          for mk in kernel/Makefile Makefile; do
+            if [ -f "$mk" ] && grep -q "DKSU_VERSION=" "$mk"; then
+              sed -i "s/-DKSU_VERSION=[0-9]\+/-DKSU_VERSION=${KSU_VERSION}/g" "$mk"
+              echo "🔧 已 patch $mk: DKSU_VERSION=${KSU_VERSION}"
+            fi
+          done
+        else
+          BASE_VERSION=30700
+          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
+          echo "🔢 自动计算版本号: $KSU_VERSION"
+        fi
+
         KSU_COMMIT_SHA=$(git rev-parse HEAD)
         echo "KSU_COMMIT_SHA=$KSU_COMMIT_SHA" >> $GITHUB_ENV
-        
+
         cd ..
-        
+
         echo "ReSukiSU" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
         echo "$KSU_VERSION" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
         echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-        
+
         echo "ReSukiSU Version: $KSU_VERSION"
         echo "✅ ReSukiSU added (commit: ${KSU_COMMIT_SHA:0:8})"
+        echo "::endgroup::"
+
+    # ============================================
+    # SukiSU-Ultra（ReSukiSU 的上游）—— 同样支持 KPM
+    # ============================================
+    - name: Add SukiSU-Ultra
+      shell: bash
+      if: ${{ inputs.ksu_type == 'SukiSU-Ultra' }}
+      run: |
+        set -euo pipefail
+        echo "::group::Add SukiSU-Ultra"
+        cd "$KERNEL_PLATFORM_FOLDER"
+        echo "Adding SukiSU-Ultra..."
+
+        if [ "${{ inputs.ksu_branch_or_hash }}" = "" ]; then
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -
+        else
+          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "${{ inputs.ksu_branch_or_hash }}"
+        fi
+
+        cd KernelSU
+
+        # —— 版本号确定 ——
+        if [ -n "${{ inputs.ksu_version_override }}" ]; then
+          KSU_VERSION="${{ inputs.ksu_version_override }}"
+          echo "🔒 使用固定版本号: $KSU_VERSION"
+          for mk in kernel/Makefile Makefile; do
+            if [ -f "$mk" ] && grep -q "DKSU_VERSION=" "$mk"; then
+              sed -i "s/-DKSU_VERSION=[0-9]\+/-DKSU_VERSION=${KSU_VERSION}/g" "$mk"
+              echo "🔧 已 patch $mk: DKSU_VERSION=${KSU_VERSION}"
+            fi
+          done
+        else
+          # SukiSU-Ultra 的 BASE_VERSION 比 ReSukiSU 高，参考社区惯例
+          BASE_VERSION=12200
+          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
+          echo "🔢 自动计算版本号: $KSU_VERSION"
+        fi
+
+        KSU_COMMIT_SHA=$(git rev-parse HEAD)
+        echo "KSU_COMMIT_SHA=$KSU_COMMIT_SHA" >> $GITHUB_ENV
+
+        cd ..
+
+        echo "SukiSU-Ultra" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
+        echo "$KSU_VERSION" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
+        echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+
+        echo "SukiSU-Ultra Version: $KSU_VERSION"
+        echo "✅ SukiSU-Ultra added (commit: ${KSU_COMMIT_SHA:0:8})"
         echo "::endgroup::"
 
     - name: Apply SUSFS Patches
@@ -1010,7 +1088,7 @@ runs:
               cd "$KSU_FOLDER"
               patch -p1 --forward --fuzz=3 < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
             else
-              echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
+              echo "ℹ️ Skipping KernelSU folder patch for ${{ inputs.ksu_type }}"
             fi
             ;;
           "v1.5.9"|"v1.5.10"|"v1.5.11"|"v1.5.12"|"v2.0.0"|"v2.1.0")
@@ -1019,7 +1097,7 @@ runs:
               patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
 
             else
-              echo "ℹ️ Skipping KernelSU folder patch for ReSukiSU"
+              echo "ℹ️ Skipping KernelSU folder patch for ${{ inputs.ksu_type }}"
             fi
             ;;
           *)
@@ -1737,7 +1815,7 @@ runs:
     # 缺任何一步 manager 都会显示 "KPM 不支持(内核未配置)"
     - name: Add KPM Support (CONFIG_KPM=y)
       shell: bash
-      if: ${{ inputs.enable_kpm == 'true' && inputs.ksu_type == 'ReSukiSU' }}
+      if: ${{ inputs.enable_kpm == 'true' && (inputs.ksu_type == 'ReSukiSU' || inputs.ksu_type == 'SukiSU-Ultra') }}
       run: |
         set -euo pipefail
         echo "::group::Add KPM Support"
@@ -2032,7 +2110,7 @@ runs:
     # 否则 manager 显示 "内核未配置"。这步必须在 Image 路径校验前完成。
     - name: 🩹 KPM patch_linux (Image 注入 KPM signature)
       shell: bash
-      if: ${{ success() && inputs.enable_kpm == 'true' && inputs.ksu_type == 'ReSukiSU' }}
+      if: ${{ success() && inputs.enable_kpm == 'true' && (inputs.ksu_type == 'ReSukiSU' || inputs.ksu_type == 'SukiSU-Ultra') }}
       run: |
         set -euo pipefail
         echo "::group::Apply patch_linux for KPM"
@@ -2285,13 +2363,20 @@ runs:
           echo "Kernel Uname: ${{ env.KERNEL_UNAME }}"
           echo "Build User: ${{ env.BUILD_USER }}"
           echo "Build Host: ${{ env.BUILD_HOST }}"
-          if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
-            echo "ReSukiSU Version: ${KSUVER:-unknown}"
-            echo "ReSukiSU commit SHA: ${KSU_SHA:-unknown}"
-          else
-            echo "KSU Version: ${KSUVER:-unknown}"
-            echo "KSU commit SHA: ${KSU_SHA:-unknown}"
-          fi
+          case "${{ inputs.ksu_type }}" in
+            ReSukiSU)
+              echo "ReSukiSU Version: ${KSUVER:-unknown}"
+              echo "ReSukiSU commit SHA: ${KSU_SHA:-unknown}"
+              ;;
+            SukiSU-Ultra)
+              echo "SukiSU-Ultra Version: ${KSUVER:-unknown}"
+              echo "SukiSU-Ultra commit SHA: ${KSU_SHA:-unknown}"
+              ;;
+            *)
+              echo "KSU Version: ${KSUVER:-unknown}"
+              echo "KSU commit SHA: ${KSU_SHA:-unknown}"
+              ;;
+          esac
           if [ "${{ env.OP_SUSFS }}" = true ]; then
             echo "SUSFS Version: ${SUSVER:-unknown}"
             echo "SUSFS commit SHA: $SUSFS_SHA"
@@ -2335,20 +2420,16 @@ runs:
           echo "| **Build User** | ${{ env.BUILD_USER }} |"
           echo "| **Build Host** | ${{ env.BUILD_HOST }} |"
           
-          if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
-            echo "| **ReSukiSU Version** | ${KSUVER:-unknown} |"
-          else
-            echo "| **KSU Version** | ${KSUVER:-unknown} |"
-          fi
-          
+          case "${{ inputs.ksu_type }}" in
+            ReSukiSU)      KSU_LABEL="ReSukiSU";      KSU_URL="https://github.com/ReSukiSU/ReSukiSU/commit/$KSU_SHA" ;;
+            SukiSU-Ultra)  KSU_LABEL="SukiSU-Ultra";  KSU_URL="https://github.com/SukiSU-Ultra/SukiSU-Ultra/commit/$KSU_SHA" ;;
+            *)             KSU_LABEL="KSU";           KSU_URL="https://github.com/tiann/KernelSU/commit/$KSU_SHA" ;;
+          esac
+          echo "| **${KSU_LABEL} Version** | ${KSUVER:-unknown} |"
           if [ "$KSU_SHA" != "unknown" ]; then
-            if [ "${{ inputs.ksu_type }}" = "ReSukiSU" ]; then
-              echo "| **ReSukiSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/ReSukiSU/ReSukiSU/commit/$KSU_SHA) |"
-            else
-              echo "| **KSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/tiann/KernelSU/commit/$KSU_SHA) |"
-            fi
+            echo "| **${KSU_LABEL} Commit** | [\`${KSU_SHA:0:8}\`]($KSU_URL) |"
           else
-            echo "| **KSU Commit** | unknown |"
+            echo "| **${KSU_LABEL} Commit** | unknown |"
           fi
           
           if [ "${{ env.OP_SUSFS }}" = true ]; then
